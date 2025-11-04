@@ -1,27 +1,26 @@
 use color_eyre::Result;
-
 use crossterm::{
     execute,
     event::{self, Event, KeyCode, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-    cursor::Show, 
+    cursor::{Show}, 
 };
-
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Rect, Layout, Constraint, Direction, Alignment},
     style::{Style, Color, Modifier},
-    widgets::{Block, Borders, Paragraph, List, ListItem, ListState},
+    widgets::{Block, Borders, Paragraph, List, ListItem, ListState, Clear}, 
     Frame,
     Terminal,
+    text::{Line, Span}
 };
-
 use std::io::{self, stdout};
 use std::env;
 use std::fs;
 use std::collections::HashMap;
-use std::process::Command; 
+use std::process::Command;
+use std::path::Path; 
 
 const DE_DM_MAP: &[(&str, &str)] = &[
     ("KDE-Desktop", "sddm"),
@@ -86,6 +85,12 @@ fn get_available_des() -> Result<Vec<String>> {
 
 }
 
+#[derive(Debug, PartialEq)]
+pub enum AppStep {
+    SelectDE,
+    InputPath
+}
+
 pub struct App {
     pub current_de_raw: String,
     pub current_de_profile: String,
@@ -93,8 +98,11 @@ pub struct App {
     pub selected_de_index: usize,
     pub selected_pkg_manager_index: usize,
     pub should_quit: bool,
+    pub current_step: AppStep,
+    pub input_buffer: String,
+    pub input_cursor_position: usize,
+    pub input_error: Option<String>
 }
-
 
 impl App {
     pub fn new() -> Result<Self> {
@@ -104,6 +112,7 @@ impl App {
 
         let current_de_profile = map_raw_de_to_profile(&current_de_raw);
         let available_des = get_available_des()?;
+        let initial_path = format!("./{}", App::generate_initial_filename(&current_de_profile, &available_des[0]));
         
         Ok(App {
             current_de_raw,
@@ -112,11 +121,39 @@ impl App {
             selected_de_index: 0,
             selected_pkg_manager_index: 0, 
             should_quit: false,
+            current_step: AppStep::SelectDE,
+            input_buffer: initial_path.clone(),
+            input_cursor_position: initial_path.len(),
+            input_error: None
         })
+    }
+
+    fn generate_initial_filename(from_profile: &str, to_profile: &str) -> String {
+        let from = from_profile.replace("-Desktop", "").replace("-Window-Manager", "");
+        let to = to_profile.replace("-Desktop", "").replace("-Window-Manager", "");
+        
+        if from == "Unknown-Desktop" {
+            format!("de_switcher_from_Unknown_to_{}.sh", to)
+        } else {
+            format!("de_switcher_{}_to_{}.sh", from.replace("-Desktop", ""), to)
+        }
+    }
+    
+    pub fn update_filename_on_de_change(&mut self) {
+        let new_filename = App::generate_initial_filename(
+            &self.current_de_profile,
+            &self.available_des[self.selected_de_index]
+        );
+        
+        if self.current_step == AppStep::SelectDE {
+            self.input_buffer = format!("./{}", new_filename);
+            self.input_cursor_position = self.input_buffer.len();
+        }
     }
 
     pub fn next_de(&mut self) {
         self.selected_de_index = (self.selected_de_index + 1) % self.available_des.len();
+        self.update_filename_on_de_change();
     }
 
     pub fn previous_de(&mut self) {
@@ -125,6 +162,7 @@ impl App {
         } else {
             self.selected_de_index = self.available_des.len() - 1;
         }
+        self.update_filename_on_de_change();
     }
     
     pub fn cycle_pkg_manager(&mut self) {
@@ -132,14 +170,7 @@ impl App {
     }
 
     pub fn generate_filename(&self) -> String {
-        let from = self.current_de_profile.replace("-Desktop", "").replace("-Window-Manager", "");
-        let to = self.available_des[self.selected_de_index].replace("-Desktop", "").replace("-Window-Manager", "");
-
-        if from == "Unknown" {
-            format!("de_switcher_from_Unknown_to_{}.sh", to)
-        } else {
-            format!("de_switcher_{}_to_{}.sh", from, to)
-        }
+        self.input_buffer.clone() 
     }
 
     pub fn generate_script(&self) -> String {
@@ -156,11 +187,14 @@ impl App {
             .map(|(_profile, dm)| *dm)
             .unwrap_or("lightdm");
 
+        let sudo_space = if sudo_cmd.is_empty() { "" } else { " " };
         let special_install_cmd = if let Some(pkg_group) = SPECIAL_INSTALL_MAP.get(target_de_profile.as_str()) {
-            format!("echo \"Installing special package group: {}\"\n{}{} -S {}\n", pkg_group, sudo_cmd, pkg_manager, pkg_group)
+            format!("echo \"Installing special package group: {}\"\n{}{}{} -S {}\n", pkg_group, sudo_cmd, sudo_space, pkg_manager, pkg_group)
         } else {
-            format!("echo \"Installing packages for {} using eos-packagelist...\"\n{} {} -S $(eos-packagelist --install \"{}\")\n", target_de_profile, sudo_cmd, pkg_manager, target_de_profile)
+            format!("echo \"Installing packages for {} using eos-packagelist...\"\n{}{}{} -S $(eos-packagelist --install \"{}\")\n", target_de_profile, sudo_cmd, sudo_space, pkg_manager, target_de_profile)
         };
+        
+        let sudo_remove_cmd_with_space = if sudo_remove_cmd.is_empty() { "" } else { " " };
 
         format!(
             r#"#!/bin/bash
@@ -188,7 +222,7 @@ if [ -n "$CURRENT_DE_PROFILE" ] && [ "$CURRENT_DE_PROFILE" != "Unknown-Desktop" 
     
     echo "Removing old DE packages (may prompt for password)..."
     # -Rcs: Remove, cascade, remove dependencies only required by package(s) being removed
-    {} {} -Rcs - < /tmp/old_de_packages.txt
+    {}{}{} -Rcs - < /tmp/old_de_packages.txt
     rm /tmp/old_de_packages.txt
 
 else
@@ -232,6 +266,7 @@ esac
             current_de_profile_for_removal, 
             target_de_profile, 
             sudo_remove_cmd, 
+            sudo_remove_cmd_with_space, 
             pkg_manager,
             special_install_cmd,
             target_dm,
@@ -239,8 +274,86 @@ esac
         )
 
     }
+    
+    pub fn validate_and_finalize_path(&mut self) -> bool {
+        let p = Path::new(&self.input_buffer);
+        
+        if p.is_dir() {
+            self.input_error = Some("Path cannot be a directory. Please provide a filename.".to_string());
+            return false;
+        }
 
+        let parent = p.parent().unwrap_or(Path::new(""));
+
+        if parent.to_string_lossy() != "" && !parent.exists() {
+             self.input_error = Some("Directory does not exist.".to_string());
+             return false;
+        }
+
+        if p.file_name().is_none() || p.file_name().unwrap().to_string_lossy().is_empty() {
+             self.input_error = Some("Filename cannot be empty.".to_string());
+             return false;
+        }
+
+        self.input_error = None;
+        self.should_quit = true;
+        true
+    }
 }
+
+fn render_path_input(f: &mut Frame, _area: Rect, app: &mut App) {
+    let area = f.area();
+    let style = Style::default().fg(Color::White).bg(Color::Black);
+    let error_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Ratio(1, 3), 
+            Constraint::Length(5),   
+            Constraint::Min(0),      
+        ])
+        .split(area);
+        
+    let centered_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 4), 
+            Constraint::Ratio(2, 4), 
+            Constraint::Ratio(1, 4), 
+        ])
+        .split(chunks[1]);
+
+    let input_area = centered_chunks[1];
+    
+    f.render_widget(Clear, input_area); 
+    
+    let border_color = if app.input_error.is_some() { Color::Red } else { Color::Cyan };
+
+    let input_block = Block::default()
+        .title(" Output Script Path (ESC to cancel) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    
+    let input_title = "Enter Path and Filename (e.g., /home/user/myscript.sh):";
+    let error_msg = app.input_error.as_ref().map_or("", |e| e.as_str());
+
+    let text = vec![
+        Line::from(input_title),
+        Line::from(""),
+        Line::from(app.input_buffer.as_str()),
+        Line::from(""),
+        Line::from(Span::styled(error_msg, error_style)),
+    ];
+
+    let paragraph = Paragraph::new(text)
+        .block(input_block)
+        .alignment(Alignment::Left)
+        .style(style);
+
+    f.render_widget(paragraph, input_area);
+}
+
 
 fn main() -> Result<()> {
     let mut app = match App::new() {
@@ -266,18 +379,21 @@ fn main() -> Result<()> {
     }
     
     if app.should_quit {
-        let file_name = app.generate_filename(); 
-        let script_content = app.generate_script();
-        let final_script_content = script_content.replace("de_switch_script.sh", &file_name); 
+        let full_path = app.generate_filename(); 
+        let file_name_only = Path::new(&full_path).file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "de_switcher.sh".to_string());
+        
+        let script_content = app.generate_script(); 
+        let final_script_content = script_content.replace("de_switch_script.sh", &file_name_only); 
 
-        match fs::write(&file_name, final_script_content) {
-            Ok(_) => println!("\nScript successfully written to **{}**\n\n**NEXT STEP: REVIEW AND RUN:**\n\t`chmod +x {}`\n\t`./{}`\n", file_name, file_name, file_name),
+        match fs::write(&full_path, final_script_content) {
+            Ok(_) => println!("\nScript successfully written to **{}**\n\n**NEXT STEP: REVIEW AND RUN:**\n\t`chmod +x {}`\n\t`{}`\n", full_path, full_path, full_path),
             Err(e) => eprintln!("\nError writing script file: {}", e),
         }
     }
 
     Ok(())
-
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
@@ -289,49 +405,86 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         terminal.draw(|f| {
             let area = f.area();
             render_ui(f, area, app);
+
+            if app.current_step == AppStep::InputPath {
+                let input_area = f.area();
+                let input_area_x = input_area.width / 4;
+                
+                let cursor_x = input_area_x + 1 + (app.input_cursor_position as u16);
+                let cursor_y = input_area.height / 3 + 3;
+
+                f.set_cursor_position((cursor_x, cursor_y));
+            }
         })?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        return Ok(());
+                match app.current_step {
+                    AppStep::SelectDE => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('j') | KeyCode::Down => app.next_de(),
+                        KeyCode::Char('k') | KeyCode::Up => app.previous_de(),
+                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cycle_pkg_manager(),
+                        KeyCode::Tab => app.cycle_pkg_manager(),
+                        KeyCode::Enter => {
+                            app.current_step = AppStep::InputPath;
+                            app.input_error = None; 
+                        }
+                        _ => {}
+                    },
+                    AppStep::InputPath => match key.code {
+                        KeyCode::Char(c) => {
+                            app.input_buffer.insert(app.input_cursor_position, c);
+                            app.input_cursor_position += 1;
+                        }
+                        KeyCode::Backspace => {
+                            if app.input_cursor_position > 0 {
+                                app.input_cursor_position -= 1;
+                                app.input_buffer.remove(app.input_cursor_position);
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if app.input_cursor_position < app.input_buffer.len() {
+                                app.input_buffer.remove(app.input_cursor_position);
+                            }
+                        }
+                        KeyCode::Left => {
+                            if app.input_cursor_position > 0 {
+                                app.input_cursor_position -= 1;
+                            }
+                        }
+                        KeyCode::Right => {
+                            if app.input_cursor_position < app.input_buffer.len() {
+                                app.input_cursor_position += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if app.validate_and_finalize_path() {
+                                return Ok(()); 
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.current_step = AppStep::SelectDE;
+                            app.input_error = None;
+                            app.update_filename_on_de_change(); 
+                        }
+                        _ => {}
                     }
-
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        app.next_de();
-                    }
-
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        app.previous_de();
-                    }
-
-                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.cycle_pkg_manager();
-                    }
-
-                    KeyCode::Tab => {
-                        app.cycle_pkg_manager();
-                    }
-
-                    KeyCode::Enter => {
-                        app.should_quit = true;
-                    }
-
-                    _ => {}
-
                 }
             }
-
         }
-
     }
-
 }
 
 
-fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
-
+fn render_ui(frame: &mut Frame, _area: Rect, app: &mut App) {
+    let area = frame.area(); 
+    
+    if app.current_step == AppStep::InputPath {
+        render_path_input(frame, area, app);
+        return;
+    }
+    
     let vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -345,11 +498,12 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
     let main_area = vertical_chunks[1];
     let footer_area = vertical_chunks[2];
 
-    let header_title = format!(" Rust DE Switcher TUI | Quickly switch desktop environments using eos-packagelist. ");
+    let header_title = format!(" de-switcher | Quickly switch desktop environments using eos-packagelist. ");
     let header_block = Block::default()
         .title(header_title)
         .title_alignment(Alignment::Left)
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT);
+        .borders(Borders::TOP | Borders::RIGHT | Borders::LEFT )
+        .border_style(Style::default().fg(Color::Yellow));
 
     frame.render_widget(header_block, top_bar_area);
 
@@ -357,16 +511,17 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
     let footer_block = Block::default()
         .title(footer_title)
         .title_alignment(Alignment::Right)
-        .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT);
+        .borders(Borders::BOTTOM | Borders::RIGHT | Borders::LEFT )
+        .border_style(Style::default().fg(Color::Yellow));
 
     frame.render_widget(footer_block, footer_area);
 
     let main_content_block_with_borders = Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT) 
-        .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)); 
-
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
+        
     frame.render_widget(main_content_block_with_borders.clone(), main_area);
-
+    
     let inner_main_area = main_content_block_with_borders.inner(main_area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -387,6 +542,7 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
     
     let list_area = top_chunks[0];
     let info_and_pkg_area = top_chunks[2];
+
     let info_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -395,27 +551,24 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .split(info_and_pkg_area);
 
+
     let info_block = Block::default()
         .title(" Info ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
-
-
+    
     let info_text = format!(
         "Current DE: **{}**\nProfile: **{}**\n\n\
          Use **j/k** or Up/Down to select a target DE.\n\
          Press **Ctrl+P** or **Tab** to change the Package Manager.\n\
-         Press **<ENTER>** to generate script.\n\
-         Press **q/Esc** to quit without action.", 
-
+         Press **<ENTER>** to set output path.", 
         app.current_de_raw,
         app.current_de_profile
     );
 
-
     let info_paragraph = Paragraph::new(info_text).block(info_block);
     frame.render_widget(info_paragraph, info_chunks[0]);
-
+    
     let current_pkg_manager = PKG_MANAGER_LIST[app.selected_pkg_manager_index];
     let pkg_manager_block = Block::default()
         .title(" Package Manager (Ctrl+P/Tab to cycle) ")
@@ -429,9 +582,10 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
         current_pkg_manager,
         current_pkg_manager
     );
-
+    
     let pkg_manager_paragraph = Paragraph::new(pkg_manager_text).block(pkg_manager_block);
     frame.render_widget(pkg_manager_paragraph, info_chunks[1]);
+
 
     let items: Vec<ListItem> = app.available_des.iter()
         .map(|de| {
@@ -459,8 +613,9 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
 
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
-    let script_content = app.generate_script();
+
     let selected_de_name = &app.available_des[app.selected_de_index];
+    let script_content = app.generate_script();
     
     let script_block = Block::default()
         .title(format!(" Script Preview for: {} ", selected_de_name))
@@ -468,9 +623,7 @@ fn render_ui(frame: &mut Frame, area: Rect, app: &mut App) {
         .border_style(Style::default().fg(Color::Red));
 
     let preview_text: String = script_content.lines().take(30).collect::<Vec<&str>>().join("\n");
-    let script_paragraph = Paragraph::new(preview_text)
-        .block(script_block);
+    let script_paragraph = Paragraph::new(preview_text).block(script_block);
 
     frame.render_widget(script_paragraph, chunks[1]);
-
-} 
+}
