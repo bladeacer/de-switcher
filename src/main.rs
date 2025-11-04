@@ -502,8 +502,7 @@ fn render_ui(frame: &mut Frame, _area: Rect, app: &mut App) {
     let header_block = Block::default()
         .title(header_title)
         .title_alignment(Alignment::Left)
-        .borders(Borders::TOP | Borders::RIGHT | Borders::LEFT )
-        .border_style(Style::default().fg(Color::Yellow));
+        .borders(Borders::TOP | Borders::RIGHT | Borders::LEFT );
 
     frame.render_widget(header_block, top_bar_area);
 
@@ -511,8 +510,7 @@ fn render_ui(frame: &mut Frame, _area: Rect, app: &mut App) {
     let footer_block = Block::default()
         .title(footer_title)
         .title_alignment(Alignment::Right)
-        .borders(Borders::BOTTOM | Borders::RIGHT | Borders::LEFT )
-        .border_style(Style::default().fg(Color::Yellow));
+        .borders(Borders::BOTTOM | Borders::RIGHT | Borders::LEFT );
 
     frame.render_widget(footer_block, footer_area);
 
