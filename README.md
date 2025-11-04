@@ -2,13 +2,33 @@
 
 ![Preview Image](./images/Preview.jpg)
 
-A Rust TUI for quickly switching between desktop environments on EndeavourOS.
+A Rust Terminal User Interface (TUI) for quickly switching between desktop
+environments on EndeavourOS.
 
 The TUI provides a simple interactive interface to:
 
 1. Select a target DE/WM from a list of available profiles.
 2. Choose the preferred package manager (`pacman`, `yay`, or `paru`).
 3. Specify the output path for the generated script.
+
+## Quick Start
+
+The TUI is made with Rust. Install it via [rustup](https://rust-lang.org/tools/install/)
+or via your distribution's package manager.
+
+[Git](https://git-scm.com/install/) is also required for cloning this repository.
+
+Once done, open a terminal and clone the repository.
+
+```bash
+git clone https://github.com/bladeacer/de-switcher
+```
+
+Then, run the following. The dependencies would be installed and the TUI would appear.
+
+```bash
+cargo run dev
+```
 
 ## Script generation
 
